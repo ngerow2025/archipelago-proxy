@@ -1,39 +1,11 @@
-use std::fs::File;
-use std::io::{self, BufReader};
-use std::sync::Arc;
-use std::{path::Path, str::FromStr};
+use std::str::FromStr;
 use std::error::Error;
 use std::net::SocketAddr;
 
 use clap::Parser;
 use futures_util::{StreamExt, TryStreamExt, future};
 use log::{info, warn, debug};
-use rcgen::CertifiedKey;
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
-
-const ENABLE_INCOMING_TLS: bool = false;
-
-
-
-// Helper function to load certificates from a PEM file
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let certfile = File::open(path)?;
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader).collect()
-}
-
-// Helper function to load the private key from a PEM file
-fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let keyfile = File::open(path)?;
-    let mut reader = BufReader::new(keyfile);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Private key not found"))
-}
-
-
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box< dyn Error>> {
@@ -42,34 +14,7 @@ async fn main() -> Result<(), Box< dyn Error>> {
     let args = Cli::parse();
 
 
-    // check if cert and key files exist, if not, generate them
-    if !Path::new("certs/cert.pem").exists() || !Path::new("certs/key.pem").exists() {
-        info!("Generating self-signed certificate and key...");
-        let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_pem = cert.pem();
-        let key_pem = signing_key.serialize_pem();
-
-        std::fs::create_dir_all("certs").unwrap();
-        std::fs::write("certs/cert.pem", cert_pem).unwrap();
-        std::fs::write("certs/key.pem", key_pem).unwrap();
-        //also write pkcs12 file
-        let pkcs12 = signing_key.p
-    }
-
-
     println!("starting proxy on port {} to {}:{}", args.input, args.output.url, args.output.port);
-
-
-
-    let mut server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(load_certs(Path::new("certs/cert.pem")).unwrap(), load_key(Path::new("certs/key.pem")).unwrap())
-        .unwrap();
-
-    server_config.alpn_protocols = vec!["http/1.1".into(), "h2".into()];
-
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", args.input)).await?;
 
@@ -77,48 +22,17 @@ async fn main() -> Result<(), Box< dyn Error>> {
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
-        debug!("accepted raw TCP connection from {}", peer_addr);
-        let tls_acceptor = acceptor.clone();
+        debug!("accepted TCP connection from {}", peer_addr);
 
         tokio::spawn(async move {
-            handle_conn(stream, peer_addr, tls_acceptor, args.output).await;
+            handle_conn(stream, peer_addr, args.output).await;
         });
 
     }
 }
-async fn handle_conn(stream: TcpStream, peer: SocketAddr, tls_acceptor: TlsAcceptor, target: URLPort) {
+async fn handle_conn(stream: TcpStream, peer: SocketAddr, target: URLPort) {
     info!("{}: new connection accepted", peer);
-
-    let mut peek_buf = [0u8; 1];
-    let n = match stream.peek(&mut peek_buf).await {
-        Ok(n) => n,
-        Err(e) => {
-            warn!("{}: peek failed: {}", peer, e);
-            return;
-        }
-    };
-    debug!("{}: peeked {} byte(s), first byte = {:#04x}", peer, n, peek_buf.get(0).copied().unwrap_or(0));
-
-    const TLS_HANDSHAKE_BYTE: u8 = 0x16;
-
-    if n > 0 && peek_buf[0] == TLS_HANDSHAKE_BYTE && ENABLE_INCOMING_TLS {
-        info!("{}: detected TLS ClientHello -> wss", peer);
-        match tls_acceptor.accept(stream).await {
-            Ok(tls_stream) => {
-                info!("{}: TLS handshake succeeded", peer);
-                handle_ws(tls_stream, peer, target).await
-            }
-            Err(e) => warn!("{}: TLS handshake failed: {}", peer, e),
-        }
-    } else if n > 0 && peek_buf[0] == TLS_HANDSHAKE_BYTE {
-        warn!("{}: incoming TLS connections are disabled, dropping connection", peer);
-    } else if n == 0 {
-        warn!("{}: connection closed before any data was sent", peer);
-    } else {
-        info!("{}: detected plaintext -> ws", peer);
-        handle_ws(stream, peer, target).await;
-    }
-
+    handle_ws(stream, peer, target).await;
     info!("{}: connection handler finished", peer);
 }
 
@@ -157,27 +71,54 @@ where
 
     info!("{}: forwarding messages between client and {}:{}", peer, target.url, target.port);
 
-    let mut forwarded: u64 = 0;
-    let result = incoming_connection
+    let (client_writer, client_reader) = incoming_connection.split();
+    let (target_writer, target_reader) = target_connection.split();
+
+    let mut client_to_target_count: u64 = 0;
+    let mut target_to_client_count: u64 = 0;
+
+    let client_to_target = client_reader
         .inspect_ok(|msg| {
-            forwarded += 1;
-            if forwarded % 100 == 0 {
-                debug!("{}: forwarded {} messages so far", peer, forwarded);
+            client_to_target_count += 1;
+            if client_to_target_count % 100 == 0 {
+                debug!("{}: forwarded {} client messages to target", peer, client_to_target_count);
             }
+            debug!("{}: client packet: {:?}", peer, msg);
         })
         .try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
-        .forward(target_connection)
-        .await;
+        .forward(target_writer);
+
+    let target_to_client = target_reader
+        .inspect_ok(|msg| {
+            target_to_client_count += 1;
+            if target_to_client_count % 100 == 0 {
+                debug!("{}: forwarded {} target messages to client", peer, target_to_client_count);
+            }
+            debug!("{}: target packet: {:?}", peer, msg);
+        })
+        .try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+        .forward(client_writer);
+
+    let result = tokio::select! {
+        result = client_to_target => result.map(|()| "client-to-target"),
+        result = target_to_client => result.map(|()| "target-to-client"),
+    };
 
     match result {
-        Ok(()) => info!("{}: connection closed normally after {} messages", peer, forwarded),
-        Err(e) => warn!("{}: error while forwarding messages after {} messages: {}", peer, forwarded, e),
+        Ok(direction) => info!(
+            "{}: connection closed normally; client->target: {}, target->client: {}",
+            peer, client_to_target_count, target_to_client_count
+        ),
+        Err(e) => warn!(
+            "{}: error while forwarding; client->target: {}, target->client: {}: {}",
+            peer, client_to_target_count, target_to_client_count, e
+        ),
     }
 }
 
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "a simple proxy for websockets targeting archipelago servers, supports secure connections", long_about = None)]
+#[command(author, version, about = "a simple plaintext proxy for websockets targeting archipelago servers", long_about = None)]
 struct Cli {
     output: URLPort,
     #[arg(default_value = "38281")]
