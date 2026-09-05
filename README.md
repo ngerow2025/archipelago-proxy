@@ -56,6 +56,9 @@ self-signed certificate, or use plaintext locally instead.
 For Chrome:
 - Go to chrome://certificate-manager/localcerts/usercerts and select "import" and navigate to the `certs/cert.pem` file.
 
+For Firefox:
+- You dont need to do this, firefox will trust localhost and allow a unsecure connection to the proxy.
+
 ## Logging
 
 Set `RUST_LOG` to control log output, this is only needed for debugging purposes. For example:
