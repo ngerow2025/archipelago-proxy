@@ -8,11 +8,10 @@ clap = { version = "4.6.6", features = ["derive"] }
 env_logger = "0.11.11"
 futures-util = "0.3.34"
 log = "0.4.34"
-native-tls = "0.2.14"
 rcgen = "0.14.10"
 rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 tokio-rustls = "0.26.4"
-tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 

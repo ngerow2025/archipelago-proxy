@@ -14,7 +14,6 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::Connector;
 
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
     let certfile = File::open(path)?;
@@ -46,21 +45,12 @@ fn create_tls_acceptor() -> Result<TlsAcceptor, Box<dyn Error>> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-fn create_tls_connector() -> Result<Connector, Box<dyn Error>> {
-    let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()?;
-    Ok(Connector::NativeTls(connector))
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let args = Cli::parse();
     let tls_acceptor = create_tls_acceptor()?;
-    let tls_connector = create_tls_connector()?;
 
     println!(
         "starting proxy on port {} to {}://{}:{}",
@@ -73,20 +63,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (stream, peer_addr) = listener.accept().await?;
         debug!("accepted TCP connection from {}", peer_addr);
         let tls_acceptor = tls_acceptor.clone();
-        let tls_connector = tls_connector.clone();
 
         tokio::spawn(async move {
-            handle_conn(stream, peer_addr, tls_acceptor, tls_connector, args.output).await;
+            handle_conn(stream, peer_addr, tls_acceptor, args.output).await;
         });
     }
 }
-async fn handle_conn(
-    stream: TcpStream,
-    peer: SocketAddr,
-    tls_acceptor: TlsAcceptor,
-    tls_connector: Connector,
-    target: URLPort,
-) {
+async fn handle_conn(stream: TcpStream, peer: SocketAddr, tls_acceptor: TlsAcceptor, target: URLPort) {
     info!("{}: new connection accepted", peer);
 
     let mut first_byte = [0u8; 1];
@@ -103,18 +86,18 @@ async fn handle_conn(
     } else if first_byte[0] == 0x16 {
         info!("{}: detected incoming TLS connection", peer);
         match tls_acceptor.accept(stream).await {
-            Ok(tls_stream) => handle_ws(tls_stream, peer, tls_connector, target).await,
+            Ok(tls_stream) => handle_ws(tls_stream, peer, target).await,
             Err(error) => warn!("{}: incoming TLS handshake failed: {}", peer, error),
         }
     } else {
         info!("{}: detected incoming plaintext connection", peer);
-        handle_ws(stream, peer, tls_connector, target).await;
+        handle_ws(stream, peer, target).await;
     }
 
     info!("{}: connection handler finished", peer);
 }
 
-async fn handle_ws<S>(stream: S, peer: SocketAddr, tls_connector: Connector, target: URLPort)
+async fn handle_ws<S>(stream: S, peer: SocketAddr, target: URLPort)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -138,7 +121,7 @@ where
         format!("{}://{}:{}", target.scheme, target.url, target.port),
         None,
         false,
-        Some(tls_connector),
+        None,
     )
     .await
     {
